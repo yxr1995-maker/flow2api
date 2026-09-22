@@ -10,6 +10,28 @@ from fastapi import WebSocket
 from ..core.logger import debug_logger
 
 
+class ExtensionCaptchaError(RuntimeError):
+    """Safe error for the captcha extension worker path.
+
+    Public message is always a fixed string.  Stage identifies the failure
+    point.  No third-party text in message or str(self).
+    """
+
+    def __init__(self, message: str, *, stage: str = "extension_error"):
+        super().__init__(message)
+        self.stage = stage
+
+
+SAFE_EXTENSION_ERROR_STAGES = {
+    "extension_script_timeout",
+    "extension_script_load_failed",
+    "extension_sitekey_invalid",
+    "extension_permission_denied",
+    "extension_script_failed",
+    "extension_empty_result",
+}
+
+
 @dataclass
 class ExtensionConnection:
     websocket: WebSocket
@@ -159,19 +181,15 @@ class ExtensionCaptchaService:
         action: str = "IMAGE_GENERATION",
         timeout: int = 20,
         token_id: Optional[int] = None,
-    ) -> Optional[str]:
+    ) -> str:
         if not self.active_connections:
             debug_logger.log_warning("[Extension Captcha] No active extension connections available.")
-            raise RuntimeError("Chrome Extension not connected or Google Labs tab not open.")
+            raise ExtensionCaptchaError("Extension worker not connected", stage="not_connected")
 
         route_key = await self._resolve_route_key(token_id)
         conn = self._select_connection(route_key)
         if conn is None:
-            available = self._describe_routes() or "none"
-            raise RuntimeError(
-                f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'. "
-                f"Available route keys: {available}"
-            )
+            raise ExtensionCaptchaError("route_unavailable", stage="route_unavailable")
 
         req_id = f"req_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
@@ -196,16 +214,24 @@ class ExtensionCaptchaService:
             if result.get("status") == "success":
                 return result.get("token")
 
-            error_msg = result.get("error")
-            debug_logger.log_error(f"[Extension Captcha] Error from extension: {error_msg}")
-            return None
+            raw_error = str(result.get("error") or "")
+            if raw_error in SAFE_EXTENSION_ERROR_STAGES:
+                stage = raw_error
+            elif "Timeout generating" in raw_error:
+                stage = "extension_script_timeout"
+            elif "Failed to load enterprise.js" in raw_error:
+                stage = "extension_script_load_failed"
+            else:
+                stage = "extension_script_failed"
+            raise ExtensionCaptchaError(stage, stage=stage)
 
         except asyncio.TimeoutError:
             debug_logger.log_error(f"[Extension Captcha] Timeout waiting for token (req_id: {req_id})")
-            return None
-        except Exception as e:
-            debug_logger.log_error(f"[Extension Captcha] Communication error: {e}")
-            return None
+            raise ExtensionCaptchaError("Extension token timeout", stage="timeout") from None
+        except ExtensionCaptchaError:
+            raise
+        except Exception:
+            raise ExtensionCaptchaError("comm_error", stage="comm_error") from None
         finally:
             self.pending_requests.pop(req_id, None)
 

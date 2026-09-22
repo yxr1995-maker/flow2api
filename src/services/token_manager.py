@@ -694,10 +694,18 @@ class TokenManager:
         try:
             from .protocol_login import protocol_loginer
 
+            proxy_url = (getattr(token, "proxy_url", "") or "").strip() or None
+            if not proxy_url:
+                flow_proxy_manager = getattr(self.flow_client, "proxy_manager", None)
+                try:
+                    fallback_proxy = await flow_proxy_manager.get_request_proxy_url() if flow_proxy_manager is not None else None
+                except Exception as exc:
+                    raise RuntimeError("PROXY_CONFIG_UNAVAILABLE") from exc
+                proxy_url = (fallback_proxy or "").strip() or None
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试协议刷新 ST...")
             login_result = await protocol_loginer.login(
                 token.google_cookies,
-                proxy=(getattr(token, "proxy_url", "") or None),
+                proxy=proxy_url,
                 email=(getattr(token, "login_account", "") or token.email or None),
             )
             if login_result.get("success") and login_result.get("session_token"):

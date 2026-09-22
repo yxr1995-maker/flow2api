@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import secrets
 import time
@@ -49,6 +49,9 @@ captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 active_admin_tokens = set()
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
+SESSION_TOKEN_MAX_LEN = 16384
+
+
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -614,6 +617,11 @@ class ProxyTestRequest(BaseModel):
     proxy_url: str
     test_url: Optional[str] = "https://labs.google/"
     timeout_seconds: Optional[int] = 15
+
+
+class ExtensionCaptchaProbeRequest(BaseModel):
+    token_id: int = Field(default=1, ge=1)
+    project_id: Optional[str] = None
 
 
 class CaptchaScoreTestRequest(BaseModel):
@@ -2267,6 +2275,100 @@ async def test_captcha_score(
         }
 
 
+@router.post("/api/captcha/extension-probe")
+async def probe_extension_captcha(
+    request: Optional[ExtensionCaptchaProbeRequest] = None,
+    _token: str = Depends(verify_admin_token),
+):
+    captcha_config = await db.get_captcha_config() if db else None
+    captcha_method = (
+        getattr(captcha_config, "captcha_method", None)
+        or config.captcha_method
+        or ""
+    ).strip().lower()
+
+    if captcha_method != "extension":
+        raise HTTPException(status_code=400, detail="Only extension captcha method supported")
+
+    req = request or ExtensionCaptchaProbeRequest()
+    token_id = req.token_id
+    project_id = (req.project_id or "").strip()
+
+    if db:
+        token_obj = await db.get_token(token_id)
+        if not token_obj:
+            raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
+        if not project_id:
+            project_id = str(token_obj.current_project_id or "").strip()
+            if not project_id:
+                projects = await db.get_projects_by_token(token_id)
+                if projects:
+                    project_id = str(projects[0].project_id or "").strip()
+
+    if not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No project_id found for token and none provided",
+        )
+
+    from ..core.logger import debug_logger
+    from ..services.browser_captcha_extension import (
+        ExtensionCaptchaError,
+        ExtensionCaptchaService,
+        SAFE_EXTENSION_ERROR_STAGES,
+    )
+
+    started_at = time.time()
+    try:
+        service = await ExtensionCaptchaService.get_instance(db)
+        raw_token = await service.get_token(
+            project_id=project_id,
+            action="IMAGE_GENERATION",
+            timeout=90,
+            token_id=token_id,
+        )
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        token_str = str(raw_token or "").strip()
+        del raw_token
+        if not token_str:
+            debug_logger.log_info(f"[Extension Captcha Probe] Returned empty token in {elapsed_ms}ms")
+            return {
+                "success": False,
+                "stage": "extension_empty_result",
+                "elapsed_ms": elapsed_ms,
+            }
+
+        debug_logger.log_info(f"[Extension Captcha Probe] Completed successfully in {elapsed_ms}ms (token discarded)")
+        return {
+            "success": True,
+            "stage": "success",
+            "elapsed_ms": elapsed_ms,
+        }
+    except ExtensionCaptchaError as e:
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        allowed_stages = SAFE_EXTENSION_ERROR_STAGES | {
+            "not_connected",
+            "route_unavailable",
+            "timeout",
+            "comm_error",
+        }
+        stage = e.stage if e.stage in allowed_stages else "unexpected"
+        debug_logger.log_info(f"[Extension Captcha Probe] Failed at stage={stage} in {elapsed_ms}ms")
+        return {
+            "success": False,
+            "stage": stage,
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception:
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        debug_logger.log_info(f"[Extension Captcha Probe] Unexpected exception in {elapsed_ms}ms")
+        return {
+            "success": False,
+            "stage": "unexpected",
+            "elapsed_ms": elapsed_ms,
+        }
+
+
 # ========== Plugin Configuration Endpoints ==========
 
 async def _verify_plugin_connection_token(authorization: Optional[str]) -> None:
@@ -2343,9 +2445,21 @@ async def update_plugin_config(
 
 @router.post("/api/plugin/update-token")
 async def plugin_update_token(request: dict, authorization: Optional[str] = Header(None)):
-    """Receive modern Google Flow cookies from the Chrome extension."""
+    """Receive a modern Google Flow session token (or Google cookies) from the extension."""
     await _verify_plugin_connection_token(authorization)
     plugin_config = await db.get_plugin_config()
+
+    session_token_raw = request.get("session_token")
+    if session_token_raw is not None and not isinstance(session_token_raw, str):
+        raise HTTPException(status_code=400, detail="session_token must be a string")
+
+    session_token_raw = (session_token_raw or "")
+    if len(session_token_raw) > SESSION_TOKEN_MAX_LEN:
+        raise HTTPException(status_code=413, detail="session_token is too large")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in session_token_raw):
+        raise HTTPException(status_code=400, detail="session_token contains invalid characters")
+
+    session_token = session_token_raw.strip()
 
     google_cookies_raw = request.get("google_cookies")
     if google_cookies_raw is not None and not isinstance(google_cookies_raw, str):
@@ -2354,27 +2468,39 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     google_cookies = (google_cookies_raw or "").strip()
     if len(google_cookies) > 524288:
         raise HTTPException(status_code=413, detail="google_cookies is too large")
-    if not google_cookies:
-        raise HTTPException(status_code=400, detail="Missing google_cookies")
+
+    if not session_token and not google_cookies:
+        raise HTTPException(status_code=400, detail="Missing session_token or google_cookies")
 
     proxy_url = str(request.get("proxy_url") or "").strip() or None
     login_account_hint = str(request.get("login_account") or "").strip() or None
-    try:
-        protocol_result = await protocol_loginer.login(
-            google_cookies,
-            proxy=proxy_url,
-            email=login_account_hint,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to derive session token from Google cookies: {str(exc)}",
-        ) from exc
 
-    session_token = str(protocol_result.get("session_token") or "").strip()
-    if not protocol_result.get("success") or not session_token:
-        error = str(protocol_result.get("error") or "Google session is invalid or expired")
-        raise HTTPException(status_code=400, detail=f"Invalid Google cookies: {error}")
+    if session_token:
+        protocol_mode = "session"
+    else:
+        if not proxy_url:
+            try:
+                fallback_proxy = await proxy_manager.get_request_proxy_url() if proxy_manager is not None else None
+            except Exception:
+                raise HTTPException(status_code=500, detail="PROXY_CONFIG_UNAVAILABLE")
+            proxy_url = (fallback_proxy or "").strip() or None
+        try:
+            protocol_result = await protocol_loginer.login(
+                google_cookies,
+                proxy=proxy_url,
+                email=login_account_hint,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to derive session token from Google cookies: {exc}",
+            ) from exc
+
+        session_token = str(protocol_result.get("session_token") or "").strip()
+        if not protocol_result.get("success") or not session_token:
+            error = str(protocol_result.get("error") or "Google session is invalid or expired")
+            raise HTTPException(status_code=400, detail=f"Invalid Google cookies: {error}")
+        protocol_mode = "protocol"
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
@@ -2399,9 +2525,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid session token") from e
 
-    protocol_mode = "protocol"
     login_account = login_account_hint or email
 
     # Step 2: Check if token with this email exists
@@ -2441,7 +2566,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 "action": "updated"
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
+            detail = f"Failed to update token: {e}" if protocol_mode != "session" else "Failed to update token"
+            raise HTTPException(status_code=500, detail=detail)
     else:
         # Add new token
         try:
@@ -2464,7 +2590,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 "token_id": new_token.id
             }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
+            detail = f"Failed to add token: {e}" if protocol_mode != "session" else "Failed to add token"
+            raise HTTPException(status_code=500, detail=detail)
 
 
 @router.post("/api/plugin/check-tokens")

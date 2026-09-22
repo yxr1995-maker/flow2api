@@ -1,0 +1,276 @@
+diff --git a/background.js b/background.js
+index 02227a9..05f3c9e 100644
+--- a/background.js
++++ b/background.js
+@@ -189,60 +189,40 @@ function deduplicateCookies(cookies) {
+     return Array.from(new Map(cookies.map(cookie => [cookieKey(cookie), cookie])).values());
+ }
+ 
+-function isGoogleCookieDomain(domain) {
+-    const normalizedDomain = normalizeCookieDomain(domain);
+-    return normalizedDomain === 'google.com' || normalizedDomain.endsWith('.google.com');
+-}
+-
+-function isGoogleAccountCookieDomain(domain) {
+-    const normalizedDomain = normalizeCookieDomain(domain);
+-    return normalizedDomain === 'google.com' || normalizedDomain === 'accounts.google.com';
+-}
+-
+-function cookiePreferenceScore(cookie) {
+-    const domain = normalizeCookieDomain(cookie.domain);
+-    let score = String(cookie.path || '').length;
++const STRUCTURED_COOKIE_DOMAINS = new Set(['google.com', 'accounts.google.com', 'flow.google.com']);
+ 
+-    if (MODERN_FLOW_COOKIE_NAMES.has(cookie.name) && domain === 'flow.google.com') {
+-        score += 10000;
+-    }
+-    if (GOOGLE_ACCOUNT_COOKIE_NAMES.has(cookie.name)) {
+-        if (domain === 'google.com') {
+-            score += 10000;
+-        } else if (domain === 'accounts.google.com') {
+-            score += 9000;
+-        }
+-    }
+-
+-    return score;
++function isStructuredCookieDomain(domain) {
++    return STRUCTURED_COOKIE_DOMAINS.has(normalizeCookieDomain(domain));
+ }
+ 
+-function buildCookieHeader(cookies) {
+-    const selectedCookies = new Map();
++function buildStructuredCookieList(cookies) {
++    const structured = [];
+ 
+     for (const cookie of cookies) {
+         if (!cookie.name || !cookie.value) {
+             continue;
+         }
+ 
+-        const domain = normalizeCookieDomain(cookie.domain);
+-        const isRelevantDomain = domain === 'flow.google.com' || isGoogleCookieDomain(domain);
+-
+-        if (!isRelevantDomain) {
++        if (!isStructuredCookieDomain(cookie.domain)) {
+             continue;
+         }
+ 
+-        const existing = selectedCookies.get(cookie.name);
+-        const cookieScore = cookiePreferenceScore(cookie);
+-        const existingScore = existing ? cookiePreferenceScore(existing) : -1;
+-        if (!existing || cookieScore > existingScore) {
+-            selectedCookies.set(cookie.name, cookie);
+-        }
++        structured.push({
++            name: cookie.name,
++            value: cookie.value,
++            domain: cookie.domain,
++            path: cookie.path,
++            secure: Boolean(cookie.secure),
++            hostOnly: Boolean(cookie.hostOnly)
++        });
+     }
+ 
+-    return Array.from(selectedCookies.values())
+-        .map(cookie => `${cookie.name}=${cookie.value}`)
+-        .join('; ');
++    return structured;
++}
++
++function isGoogleAccountCookieDomain(domain) {
++    const normalizedDomain = normalizeCookieDomain(domain);
++    return normalizedDomain === 'google.com' || normalizedDomain === 'accounts.google.com';
+ }
+ 
+ async function collectRelevantCookies() {
+@@ -293,6 +273,60 @@ function parseServerErrorMessage(responseText) {
+     return raw.slice(0, 300);
+ }
+ 
++async function sendPayloadToServer(config, payload) {
++    await Logger.info('正在发送到服务器...');
++
++    const response = await fetch(config.apiUrl, {
++        method: 'POST',
++        headers: {
++            'Content-Type': 'application/json',
++            'Authorization': 'Bearer ' + config.connectionToken
++        },
++        body: JSON.stringify(payload)
++    });
++
++    if (!response.ok) {
++        const errorText = await response.text();
++        const serverError = parseServerErrorMessage(errorText);
++        await Logger.error('服务器错误', {
++            status: response.status,
++            error: serverError
++        });
++
++        return {
++            success: false,
++            error: serverError
++                ? '服务器错误 ' + response.status + ': ' + serverError
++                : '服务器错误: ' + response.status
++        };
++    }
++
++    const result = await response.json();
++
++    if (result.action === 'updated') {
++        await Logger.success('✅ Token已更新到上游', {
++            action: '更新现有Token',
++            message: result.message
++        });
++    } else if (result.action === 'added') {
++        await Logger.success('✅ Token已添加到上游', {
++            action: '添加新Token',
++            message: result.message
++        });
++    } else {
++        await Logger.success('✅ Token已同步到上游', result);
++    }
++
++    return {
++        success: true,
++        message: result.message || 'Token更新成功',
++        action: result.action,
++        displayMessage: result.action === 'updated'
++            ? '✅ 成功更新到上游\n' + result.message
++            : '✅ 成功添加到上游\n' + result.message
++    };
++}
++
+ // 提取cookie并发送到服务器
+ async function extractAndSendToken() {
+     let tab = null;
+@@ -310,6 +344,27 @@ async function extractAndSendToken() {
+ 
+         await Logger.info('配置已加载', { apiUrl: config.apiUrl });
+ 
++        // 优先使用浏览器会话 labs.google/fx 的 NextAuth session token，有值时直接发送，不打开Flow页面、不读取Google cookie
++        let sessionCookie = null;
++        try {
++            const cookie = await chrome.cookies.get({
++                url: 'https://labs.google/fx/',
++                name: '__Secure-next-auth.session-token'
++            });
++            sessionCookie = (cookie && cookie.value) ? cookie.value : null;
++        } catch (error) {
++            await Logger.error('读取browser-session cookie失败', { error: error.message });
++        }
++
++        if (sessionCookie) {
++            await Logger.info('Flow Cookie提取成功', {
++                mode: 'browser-session'
++            });
++            return await sendPayloadToServer(config, {
++                session_token: sessionCookie
++            });
++        }
++
+         // 1. 打开新版Flow页面（在后台），让浏览器刷新当前登录态
+         await Logger.info('正在打开Google Flow页面...');
+         tab = await chrome.tabs.create({
+@@ -344,7 +399,8 @@ async function extractAndSendToken() {
+             && isGoogleAccountCookieDomain(cookie.domain)
+             && cookie.value
+         ));
+-        const googleCookies = buildCookieHeader(uniqueCookies);
++        const structuredCookies = buildStructuredCookieList(uniqueCookies);
++        const googleCookies = JSON.stringify(structuredCookies);
+ 
+         if (modernFlowCookie) {
+             await Logger.success('找到新版Flow Cookie', {
+@@ -383,74 +439,23 @@ async function extractAndSendToken() {
+             };
+         }
+ 
+-        if (!googleCookies) {
++        if (structuredCookies.length === 0) {
+             await Logger.error('Cookie序列化失败');
+             return { success: false, error: '未生成可同步的Cookie数据。' };
+         }
+ 
+         await Logger.info('Flow Cookie提取成功', {
+             mode: 'modern-cookie',
+-            cookieCount: googleCookies.split('; ').length
++            cookieCount: structuredCookies.length
+         });
+ 
+         // 3. 发送到服务器
+-        await Logger.info('正在发送到服务器...');
+-
+         const payload = {
+             google_cookies: googleCookies,
+             protocol_mode: 'protocol'
+         };
+ 
+-        const response = await fetch(config.apiUrl, {
+-            method: 'POST',
+-            headers: {
+-                'Content-Type': 'application/json',
+-                'Authorization': `Bearer ${config.connectionToken}`
+-            },
+-            body: JSON.stringify(payload)
+-        });
+-
+-        if (!response.ok) {
+-            const errorText = await response.text();
+-            const serverError = parseServerErrorMessage(errorText);
+-            await Logger.error('服务器错误', {
+-                status: response.status,
+-                error: serverError
+-            });
+-
+-            return {
+-                success: false,
+-                error: serverError
+-                    ? `服务器错误 ${response.status}: ${serverError}`
+-                    : `服务器错误: ${response.status}`
+-            };
+-        }
+-
+-        const result = await response.json();
+-
+-        // 根据action显示不同的日志信息
+-        if (result.action === 'updated') {
+-            await Logger.success('✅ Token已更新到上游', {
+-                action: '更新现有Token',
+-                message: result.message
+-            });
+-        } else if (result.action === 'added') {
+-            await Logger.success('✅ Token已添加到上游', {
+-                action: '添加新Token',
+-                message: result.message
+-            });
+-        } else {
+-            await Logger.success('✅ Token已同步到上游', result);
+-        }
+-
+-        return {
+-            success: true,
+-            message: result.message || 'Token更新成功',
+-            action: result.action,
+-            displayMessage: result.action === 'updated'
+-                ? `✅ 成功更新到上游\n${result.message}`
+-                : `✅ 成功添加到上游\n${result.message}`
+-        };
++        return await sendPayloadToServer(config, payload);
+ 
+     } catch (error) {
+         await Logger.error('提取过程出错', {
+diff --git a/manifest.json b/manifest.json
+index 00120c4..5bc2baa 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -13,7 +13,8 @@
+   ],
+   "host_permissions": [
+     "https://google.com/*",
+-    "https://*.google.com/*"
++    "https://*.google.com/*",
++    "https://labs.google/*"
+   ],
+   "background": {
+     "service_worker": "background.js"
