@@ -1,6 +1,7 @@
 """Protocol login for labs.google NextAuth with exported Google cookies."""
 
 import json
+import http.cookiejar
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse, unquote
@@ -14,6 +15,27 @@ LABS_BASE = "https://labs.google/fx"
 SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
 IMPERSONATE = "chrome124"
 GOOGLE_COOKIE_NAMES = ("SID", "HSID", "SSID", "APISID", "SAPISID")
+COOKIE_RECORD_DOMAINS = frozenset({"google.com", "accounts.google.com", "flow.google.com"})
+OAUTH_REDIRECT_HOSTS = frozenset({"google.com", "accounts.google.com"})
+LABS_HOST = "labs.google"
+LABS_CALLBACK_PATH = "/fx/api/auth/callback/google"
+
+
+_REJECTED_BROWSER_NOT_SECURE = "this browser or app may not be secure"
+_REJECTED_JAVASCRIPT_REQUIRED = "javascript is required"
+_REJECTED_COOKIES_REQUIRED = "cookies are required"
+
+
+def _classify_rejected_body(body: object) -> str:
+    text = body if isinstance(body, str) else ""
+    t = text.lower()
+    if _REJECTED_BROWSER_NOT_SECURE in t:
+        return "browser_not_secure"
+    if _REJECTED_JAVASCRIPT_REQUIRED in t:
+        return "javascript_required"
+    if _REJECTED_COOKIES_REQUIRED in t:
+        return "cookies_required"
+    return "rejected_unspecified"
 
 
 def _parse_google_cookies(raw: str) -> Dict[str, str]:
@@ -76,6 +98,109 @@ def _parse_google_cookies(raw: str) -> Dict[str, str]:
 
 def _build_cookie_header(cookies: Dict[str, str]) -> str:
     return "; ".join(f"{name}={value}" for name, value in cookies.items() if name and value)
+
+
+def _parse_google_cookie_record(item):
+    if not isinstance(item, dict):
+        raise ValueError("invalid google cookie payload")
+    name = item.get("name")
+    value = item.get("value")
+    domain = item.get("domain")
+    path = item.get("path")
+    secure = item.get("secure", False)
+    host_only = item.get("hostOnly", False)
+    if not all(isinstance(x, str) for x in (name, value, domain, path)):
+        raise ValueError("invalid google cookie payload")
+    if not isinstance(secure, bool) or not isinstance(host_only, bool):
+        raise ValueError("invalid google cookie payload")
+    for field in (name, value, domain, path):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in field):
+            raise ValueError("invalid google cookie payload")
+    name = name.strip()
+    domain = domain.strip()
+    if not name or len(domain) - len(domain.lstrip(".")) > 1:
+        raise ValueError("invalid google cookie payload")
+    if domain != domain.lower() or domain.lstrip(".") not in COOKIE_RECORD_DOMAINS:
+        raise ValueError("invalid google cookie payload")
+    if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+        raise ValueError("invalid google cookie payload")
+    if any(ch in value for ch in (";", ",")):
+        raise ValueError("invalid google cookie payload")
+    if not path.startswith("/"):
+        raise ValueError("invalid google cookie payload")
+    if host_only:
+        domain = domain.lstrip(".")
+    return {
+        "name": name,
+        "value": value,
+        "domain": domain,
+        "path": path,
+        "secure": secure,
+        "host_only": host_only,
+    }
+
+
+def _parse_google_cookie_records(raw):
+    try:
+        data = json.loads((raw or "").strip() or "null")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        data = data.get("cookies")
+    if not isinstance(data, list) or len(data) == 0:
+        return None
+    return [_parse_google_cookie_record(item) for item in data]
+
+
+def _make_jar_cookie(name, value, domain, path, secure, host_only):
+    return http.cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=not host_only,
+        domain_initial_dot=domain.startswith("."),
+        path=path,
+        path_specified=True,
+        secure=secure,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+        rfc2109=False,
+    )
+
+
+def _seed_google_cookies(session, cookies, raw=None):
+    jar = session.cookies.jar
+    records = _parse_google_cookie_records(raw)
+    if records is not None:
+        for cookie in records:
+            jar.set_cookie(_make_jar_cookie(
+                cookie["name"], cookie["value"], cookie["domain"], cookie["path"],
+                cookie["secure"], cookie["host_only"],
+            ))
+        return
+    for name, value in cookies.items():
+        if not name or not value:
+            continue
+        for field in (name, value):
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in field):
+                raise ValueError("invalid google cookie payload")
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError("invalid google cookie payload")
+        if any(ch in value for ch in (";", ",")):
+            raise ValueError("invalid google cookie payload")
+        if name in ("OSID", "__Secure-OSID"):
+            domain = "flow.google.com"
+            host_only = True
+        else:
+            domain = ".google.com"
+            host_only = False
+        jar.set_cookie(_make_jar_cookie(name, value, domain, "/", True, host_only))
 
 
 def _get_set_cookies(headers: Any) -> List[str]:
@@ -186,6 +311,76 @@ def _append_login_hint(target_url: str, email: Optional[str]) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+def _validate_login_url(url: str, *, labs: bool = False, callback: bool = False) -> None:
+    """Reject redirects outside the authentication origins before sending cookies."""
+    try:
+        parsed = urlparse(url)
+        valid = (
+            parsed.scheme == "https"
+            and parsed.hostname in ({LABS_HOST} if labs or callback else OAUTH_REDIRECT_HOSTS)
+            and parsed.port in (None, 443)
+            and parsed.username is None and parsed.password is None
+            and not any(ord(char) < 33 for char in url)
+            and (not callback or parsed.path == LABS_CALLBACK_PATH)
+        )
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError("UNEXPECTED_AUTH_REDIRECT")
+
+
+def _is_login_callback(url: str) -> bool:
+    try:
+        _validate_login_url(url, callback=True)
+        return True
+    except ValueError:
+        return False
+
+
+KNOWN_OAUTH_ERRORS = frozenset({
+    "access_denied", "canceled", "user_canceled", "invalid_request",
+    "unauthorized", "unsupported_response_type", "server_error",
+    "temporarily_disabled", "disallowed_user_agent", "access_denied_cancel",
+})
+
+HOP_PATH_ENUM = {
+    "/v3/signin/rejected": "signin_rejected",
+    "/signin/rejected": "signin_rejected",
+    "/signin/v2/rejected": "signin_rejected",
+    "/signin/v2/identifier": "signin_identifier",
+    "/v3/signin/identifier": "signin_identifier",
+    "/signin/v2/challenge/pwd": "signin_challenge",
+    "/o/oauth2/auth": "oauth2_auth",
+    "/o/oauth2/v2/auth": "oauth2_auth",
+    "/signin/oauth/error": "oauth_error",
+}
+
+
+def _extract_oauth_error(url: str) -> str:
+    """Return one whitelisted OAuth error enum from the URL, else 'unknown'."""
+    try:
+        parsed = urlparse(url)
+    except (TypeError, ValueError):
+        return "unknown"
+    if parsed.hostname not in OAUTH_REDIRECT_HOSTS:
+        return "unknown"
+    error_vals = [v for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k == "error"]
+    if error_vals and error_vals[0] in KNOWN_OAUTH_ERRORS:
+        return error_vals[0]
+    return "unknown"
+
+
+def _classify_hop(url: str) -> str:
+    """Return the fixed enum for a known Google auth path, else 'other'."""
+    try:
+        parsed = urlparse(url)
+    except (TypeError, ValueError):
+        return "other"
+    if parsed.hostname not in OAUTH_REDIRECT_HOSTS:
+        return "other"
+    return HOP_PATH_ENUM.get(parsed.path, "other")
+
+
 class ProtocolLogin:
     """Login to labs.google/fx through NextAuth Google OAuth using Google cookies."""
 
@@ -240,18 +435,18 @@ class ProtocolLogin:
                 signin_data = signin_resp.json() or {}
                 redirect_url = signin_data.get("redirect") or signin_data.get("url")
                 if not redirect_url:
-                    return {"success": False, "error": f"无重定向 URL: {json.dumps(signin_data)[:200]}"}
+                    return {"success": False, "error": "登录响应缺少重定向 URL"}
                 redirect_url = _append_login_hint(redirect_url, email)
 
-                google_cookie_header = _build_cookie_header(google_cookies)
+                _seed_google_cookies(session, google_cookies, raw=google_cookies_raw)
                 callback_url = ""
                 current_url = redirect_url
 
                 for attempt in range(10):
+                    _validate_login_url(current_url)
                     oauth_resp = await session.get(
                         current_url,
                         headers={
-                            "Cookie": google_cookie_header,
                             "Referer": "https://labs.google/" if attempt == 0 else "https://accounts.google.com/",
                         },
                         allow_redirects=False,
@@ -259,21 +454,29 @@ class ProtocolLogin:
                     location = (oauth_resp.headers.get("location") or "").strip()
                     if location:
                         location = urljoin(current_url, location)
-                        if "labs.google/fx/api/auth/callback/google" in location:
+                        if _is_login_callback(location):
                             callback_url = location
                             break
                         current_url = location
                         continue
 
                     body = oauth_resp.text or ""
+                    page = _classify_hop(current_url)
+                    oauth_err = _extract_oauth_error(current_url)
                     if "signin/rejected" in body.lower():
-                        return {"success": False, "error": "Google 拒绝登录，Cookies 可能已过期或被风控"}
+                        reason = _classify_rejected_body(body)
+                        try:
+                            http_code = int(oauth_resp.status_code)
+                        except (TypeError, ValueError):
+                            http_code = -1
+                        debug_logger.log_error(f"[PROTOCOL_LOGIN] auth-rejected page={page} oauth_error={oauth_err}")
+                        return {"success": False, "error": f"Google 拒绝登录（HTTP {http_code}，hop={attempt + 1}，page={page}，reason={reason}，oauth_error={oauth_err}）"}
 
                     if oauth_resp.status_code == 200:
                         html_redirect = _extract_redirect_from_html(body)
                         if html_redirect:
                             html_redirect = urljoin(current_url, html_redirect)
-                            if "labs.google/fx/api/auth/callback/google" in html_redirect:
+                            if _is_login_callback(html_redirect):
                                 callback_url = html_redirect
                                 break
                             current_url = html_redirect
@@ -287,6 +490,7 @@ class ProtocolLogin:
                 if not callback_url:
                     return {"success": False, "error": "Google OAuth 流程中未获得 callback URL"}
 
+                _validate_login_url(callback_url, callback=True)
                 callback_resp = await session.get(
                     callback_url,
                     headers={
@@ -305,8 +509,10 @@ class ProtocolLogin:
                     location = (callback_resp.headers.get("location") or "").strip()
                     if not location or callback_resp.status_code not in (301, 302, 303, 307, 308):
                         break
+                    callback_url = urljoin(callback_url, location)
+                    _validate_login_url(callback_url, labs=True)
                     callback_resp = await session.get(
-                        urljoin(callback_url, location),
+                        callback_url,
                         headers={"Cookie": _build_cookie_header(labs_cookies)},
                         allow_redirects=False,
                     )
@@ -317,8 +523,11 @@ class ProtocolLogin:
                     return {"success": False, "error": "未获取到 session token，Google session 可能已过期"}
                 return {"success": True, "session_token": session_token}
             except Exception as exc:
-                debug_logger.log_error(f"[PROTOCOL_LOGIN] 协议登录异常: {exc}")
-                return {"success": False, "error": str(exc)}
+                error = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+                    "invalid google cookie payload", "UNEXPECTED_AUTH_REDIRECT"
+                } else "GOOGLE_PROTOCOL_REQUEST_FAILED"
+                debug_logger.log_error(f"[PROTOCOL_LOGIN] {error}")
+                return {"success": False, "error": error}
 
 
 protocol_loginer = ProtocolLogin()

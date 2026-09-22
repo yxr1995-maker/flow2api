@@ -4534,10 +4534,10 @@ class FlowClient:
         debug_logger.log_info(f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}")
 
         if captcha_method == "extension":
+            from .browser_captcha_extension import ExtensionCaptchaError, ExtensionCaptchaService
             try:
-                from .browser_captcha_extension import ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance(self.db)
-                extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
+                extension_timeout = 60 if action == "VIDEO_GENERATION" else 45
                 token = await service.get_token(
                     project_id,
                     action,
@@ -4546,10 +4546,14 @@ class FlowClient:
                 )
                 self._set_request_fingerprint(None)
                 return token, None
-            except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")
+            except ExtensionCaptchaError as e:
+                debug_logger.log_error(f"[reCAPTCHA Extension] {e.stage}")
                 self._set_request_fingerprint(None)
-                return None, None
+                raise
+            except Exception:
+                debug_logger.log_error("[reCAPTCHA Extension] unexpected error")
+                self._set_request_fingerprint(None)
+                raise ExtensionCaptchaError("unexpected", stage="unexpected") from None
 
         # 内置浏览器打码 (nodriver)
         if captcha_method == "personal":

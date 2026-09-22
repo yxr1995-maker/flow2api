@@ -89,7 +89,7 @@ async function connectWS() {
     ws = new WebSocket(url.toString());
 
     ws.onopen = () => {
-        console.log("[Flow2API] Background connected to WebSocket", url.toString());
+        console.log("[Flow2API] Background connected to WebSocket", url.origin + url.pathname);
         ws.send(JSON.stringify({
             type: "register",
             route_key: settings.routeKey,
@@ -140,63 +140,162 @@ async function connectWS() {
 
 async function handleGetToken(data) {
     let newTabId = null;
+    const sendError = (errorCode) => {
+        ws.send(JSON.stringify({
+            req_id: data.req_id,
+            status: "error",
+            error: errorCode
+        }));
+    };
     try {
-        console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
-        const newTab = await chrome.tabs.create({ url: "https://labs.google/fx/tools/flow", active: false });
+        const projectId = (data && data.project_id ? String(data.project_id).trim() : "");
+        const targetUrl = projectId
+            ? `https://flow.google.com/project/${encodeURIComponent(projectId)}`
+            : "https://flow.google.com/";
+        console.log("[Flow2API] Opening Flow page:", targetUrl);
+        const newTab = await chrome.tabs.create({ url: targetUrl, active: false });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
         await sleep(1200);
 
         let successResponse = null;
-        let lastErrorMsg = "No response from tab.";
+        let lastErrorCode = "extension_script_failed";
         const scriptTimeoutMs = data.action === "VIDEO_GENERATION" ? 30000 : 20000;
 
         try {
             const results = await chrome.scripting.executeScript({
                 target: { tabId: newTabId },
                 world: "MAIN",
-                func: async (action, timeoutMs) => {
-                    return new Promise((resolve, reject) => {
+                func: async (action, scriptTimeoutMs) => {
+                    return new Promise((resolve) => {
                         let settled = false;
-                        const finish = (fn, value) => {
+                        let pollInterval = null;
+                        let readyTimeout = null;
+                        let overallTimer = null;
+
+                        const finish = (value) => {
                             if (settled) return;
                             settled = true;
-                            fn(value);
+                            if (overallTimer) clearTimeout(overallTimer);
+                            if (readyTimeout) clearTimeout(readyTimeout);
+                            if (pollInterval) clearInterval(pollInterval);
+                            overallTimer = null;
+                            readyTimeout = null;
+                            pollInterval = null;
+                            resolve(value);
                         };
+
+                        function classify(e) {
+                            const msg = (e && (e.message || e.toString())) ? String(e.message || e) : "";
+                            if (/Invalid site key|Invalid key type|not loaded in api.js|site key is not valid/i.test(msg)) {
+                                return "extension_sitekey_invalid";
+                            }
+                            if (/TrustedScriptURL|Trusted Types|Content Security Policy|CSP|script-src/i.test(msg)) {
+                                return "extension_script_load_failed";
+                            }
+                            return "extension_script_failed";
+                        }
+
+                        function findSiteKey() {
+                            const scripts = document.querySelectorAll ? document.querySelectorAll("script[src]") : (document.scripts || []);
+                            for (let i = 0; i < scripts.length; i++) {
+                                const s = scripts[i];
+                                const src = (s.getAttribute ? s.getAttribute("src") : s.src) || "";
+                                if (src.indexOf("recaptcha/enterprise.js") === -1) continue;
+                                const m = src.match(/[?&]render=([^&]+)/);
+                                if (m && m[1]) {
+                                    const key = decodeURIComponent(m[1]).trim();
+                                    if (key && key.toLowerCase() !== "explicit") {
+                                        return key;
+                                    }
+                                }
+                            }
+                            return null;
+                        }
+
                         try {
-                            function run() {
-                                grecaptcha.enterprise.ready(function() {
-                                    grecaptcha.enterprise.execute("6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", { action: action })
-                                        .then(token => finish(resolve, token))
-                                        .catch(err => finish(reject, err.message || "reCAPTCHA evaluation failed internally"));
-                                });
+                            overallTimer = setTimeout(() => {
+                                finish({ ok: false, errorCode: "extension_script_timeout" });
+                            }, scriptTimeoutMs);
+
+                            const maxReadyWaitMs = Math.min(10000, Math.floor(scriptTimeoutMs / 2));
+                            readyTimeout = setTimeout(() => {
+                                if (pollInterval) clearInterval(pollInterval);
+                                pollInterval = null;
+                                finish({ ok: false, errorCode: "extension_script_load_failed" });
+                            }, maxReadyWaitMs);
+
+                            function run(siteKey) {
+                                try {
+                                    grecaptcha.enterprise.ready(function() {
+                                        try {
+                                            grecaptcha.enterprise.execute(siteKey, { action: action })
+                                                .then(token => {
+                                                    if (token) {
+                                                        finish({ ok: true, token: token });
+                                                    } else {
+                                                        finish({ ok: false, errorCode: "extension_empty_result" });
+                                                    }
+                                                })
+                                                .catch(err => finish({ ok: false, errorCode: classify(err) }));
+                                        } catch (e) {
+                                            finish({ ok: false, errorCode: classify(e) });
+                                        }
+                                    });
+                                } catch (e) {
+                                    finish({ ok: false, errorCode: classify(e) });
+                                }
                             }
 
-                            if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
-                                run();
-                            } else {
-                                const s = document.createElement("script");
-                                s.src = "https://www.google.com/recaptcha/enterprise.js?render=6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-                                s.onload = run;
-                                s.onerror = () => finish(reject, "Failed to load enterprise.js via network");
-                                document.head.appendChild(s);
+                            function checkReady() {
+                                try {
+                                    const key = findSiteKey();
+                                    const hasEnterprise = typeof grecaptcha !== "undefined" && grecaptcha && grecaptcha.enterprise;
+                                    if (key && hasEnterprise) {
+                                        if (readyTimeout) clearTimeout(readyTimeout);
+                                        if (pollInterval) clearInterval(pollInterval);
+                                        readyTimeout = null;
+                                        pollInterval = null;
+                                        run(key);
+                                        return true;
+                                    }
+                                } catch (e) {
+                                    // continue polling until readyTimeout
+                                }
+                                return false;
                             }
 
-                            setTimeout(() => finish(reject, "Timeout generating reCAPTCHA locally"), timeoutMs);
+                            if (!checkReady()) {
+                                pollInterval = setInterval(checkReady, 100);
+                            }
                         } catch (e) {
-                            finish(reject, e.message);
+                            finish({ ok: false, errorCode: classify(e) });
                         }
                     });
                 },
                 args: [data.action || "IMAGE_GENERATION", scriptTimeoutMs]
             });
 
-            if (results && results[0] && results[0].result) {
-                successResponse = { status: "success", token: results[0].result };
+            if (!results || !results.length || !results[0] || results[0].result === undefined || results[0].result === null) {
+                lastErrorCode = "extension_empty_result";
+            } else {
+                const result = results[0].result;
+                if (result && result.ok === true && typeof result.token === "string" && result.token) {
+                    successResponse = { status: "success", token: result.token };
+                } else if (result && typeof result.errorCode === "string" && result.errorCode) {
+                    lastErrorCode = result.errorCode;
+                } else {
+                    lastErrorCode = "extension_empty_result";
+                }
             }
         } catch (e) {
-            lastErrorMsg = e.message || "Script execution failed";
+            const msg = (e && e.message) ? String(e.message) : "";
+            if (/access contents|host permission/i.test(msg)) {
+                lastErrorCode = "extension_permission_denied";
+            } else {
+                lastErrorCode = "extension_script_failed";
+            }
         }
 
         if (successResponse) {
@@ -206,18 +305,10 @@ async function handleGetToken(data) {
                 token: successResponse.token
             }));
         } else {
-            ws.send(JSON.stringify({
-                req_id: data.req_id,
-                status: "error",
-                error: "Extension script failed: " + lastErrorMsg
-            }));
+            sendError(lastErrorCode);
         }
     } catch (err) {
-        ws.send(JSON.stringify({
-            req_id: data.req_id,
-            status: "error",
-            error: err.message
-        }));
+        sendError("extension_script_failed");
     } finally {
         if (newTabId) {
             try {
@@ -239,4 +330,18 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     }
 });
 
-connectWS();
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+        handleGetToken,
+        connectWS,
+        closeSocket,
+        getSettings,
+        DEFAULT_SETTINGS,
+        waitForTabReady,
+        sleep
+    };
+}
+
+if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
+    connectWS();
+}
